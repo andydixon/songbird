@@ -1,16 +1,13 @@
 [package]
-name = "ariadne"
+name = "libcrypt-songbird"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-2.0-or-later WITH Bison-exception-2.2"
+description = "Songbird Encryption SB-01"
 
 [lib]
 name = "songbird"
 path = "src/lib.rs"
 
 [dependencies]
-thiserror = "1"
-pqcrypto = "0.18.1"
-hkdf = "0.11"
-sha3 = "0.10"
-chacha20 = "0.9"
-rand = "0.8"
+thiserror = "2.0.8"
