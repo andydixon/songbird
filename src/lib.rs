@@ -21,7 +21,7 @@ pub trait nugg {
 /// - `chup_positions` are the nugg positions that trigger the next nugg step.
 /// - `position` is the current nugg offset.
 /// - `ring_setting` is an additional offset (similar to historical ring setting).
-pub struct Standardnugg {
+pub struct StandardNugg {
     idea: [u8; 256],
     inverse_idea: [u8; 256],
     chup_positions: Vec<u8>,
@@ -29,8 +29,8 @@ pub struct Standardnugg {
     ring_setting: u8,
 }
 
-impl Standardnugg {
-    /// Create a new `Standardnugg`.
+impl StandardNugg {
+    /// Create a new `StandardNugg`.
     /// - `idea_bytes`: a 256-byte array containing a permutation of [0..255].
     /// - `chup_bytes`: positions at which this nugg triggers stepping of the next nugg.
     /// - `initial_pos`: initial nugg position.
@@ -70,7 +70,7 @@ impl Standardnugg {
     }
 }
 
-impl nugg for Standardnugg {
+impl nugg for StandardNugg {
     fn step(&mut self) {
         self.position = self.position.wrapping_add(1);
     }
