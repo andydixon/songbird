@@ -1,402 +1,233 @@
-use chacha20::cipher::{KeyIvInit, StreamCipher};
-use chacha20::ChaCha20;
-use hkdf::Hkdf;
-use pqcrypto::kem::kyber1024;
-use sha3::Sha3_256;
-use std::collections::HashMap;
 use thiserror::Error;
 
-/// Errors that can occur in the Songbird-like machine and configuration.
+/// Errors that can occur in the Songbird machine operations.
 #[derive(Debug, Error)]
 pub enum SongbirdError {
-    #[error("Character '{0}' not in character set.")]
-    CharNotInSet(char),
     #[error("Configuration error: {0}")]
     ConfigError(String),
-    #[error("Key exchange error: {0}")]
-    KeyExchangeError(String),
-    #[error("HKDF expansion error")]
-    HkdfError,
 }
 
-/// The CharacterSet defines the domain of characters for the Songbird-like machine.
-pub struct CharacterSet {
-    chars: Vec<char>,
-    index_map: HashMap<char, usize>,
-}
-
-impl CharacterSet {
-    pub fn new(chars: &[char]) -> Result<Self, SongbirdError> {
-        let mut index_map = HashMap::new();
-        for (i, &c) in chars.iter().enumerate() {
-            if index_map.contains_key(&c) {
-                return Err(SongbirdError::ConfigError("Duplicate char in set".into()));
-            }
-            index_map.insert(c, i);
-        }
-        Ok(CharacterSet {
-            chars: chars.to_vec(),
-            index_map,
-        })
-    }
-
-    pub fn size(&self) -> usize {
-        self.chars.len()
-    }
-
-    pub fn char_to_index(&self, c: char) -> Result<usize, SongbirdError> {
-        self.index_map
-            .get(&c)
-            .copied()
-            .ok_or(SongbirdError::CharNotInSet(c))
-    }
-
-    pub fn index_to_char(&self, i: usize) -> char {
-        self.chars[i]
-    }
-}
-
-/// A Nugget trait for the Songbird-like machine.
-pub trait Nugget {
+/// A nugg trait operating on `u8` values [0..255].
+pub trait nugg {
     fn step(&mut self);
-    fn forward(&self, c_idx: usize) -> usize;
-    fn backward(&self, c_idx: usize) -> usize;
-    fn at_meditation(&self) -> bool;
+    fn forward(&self, input: u8) -> u8;
+    fn backward(&self, input: u8) -> u8;
+    fn at_chup(&self) -> bool;
 }
 
-/// A standard nugget implementation.
-pub struct StandardNugget {
-    wiring: Vec<usize>,
-    inverse_wiring: Vec<usize>,
-    meditation_positions: Vec<usize>,
-    position: usize,
-    ring_setting: usize,
-    size: usize,
+/// A standard Songbird nugg for binary data.
+/// - `idea` is a 256-byte permutation.
+/// - `inverse_idea` is computed automatically.
+/// - `chup_positions` are the nugg positions that trigger the next nugg step.
+/// - `position` is the current nugg offset.
+/// - `ring_setting` is an additional offset (similar to historical ring setting).
+pub struct Standardnugg {
+    idea: [u8; 256],
+    inverse_idea: [u8; 256],
+    chup_positions: Vec<u8>,
+    position: u8,
+    ring_setting: u8,
 }
 
-impl StandardNugget {
+impl Standardnugg {
+    /// Create a new `Standardnugg`.
+    /// - `idea_bytes`: a 256-byte array containing a permutation of [0..255].
+    /// - `chup_bytes`: positions at which this nugg triggers stepping of the next nugg.
+    /// - `initial_pos`: initial nugg position.
+    /// - `ring_setting`: ring offset (1-based, subtract 1 internally).
     pub fn new(
-        charset: &CharacterSet,
-        wiring_chars: &[char],
-        meditation_chars: &[char],
-        initial_char: char,
-        ring_setting: usize,
+        idea_bytes: [u8; 256],
+        chup_bytes: &[u8],
+        initial_pos: u8,
+        ring_setting: u8,
     ) -> Result<Self, SongbirdError> {
-        let size = charset.size();
-        if wiring_chars.len() != size {
-            return Err(SongbirdError::ConfigError("Wiring must cover entire set".into()));
-        }
-
-        let mut wiring = vec![0; size];
-        let mut used = vec![false; size];
-        for (i, &wc) in wiring_chars.iter().enumerate() {
-            let idx = charset.char_to_index(wc)?;
-            if used[idx] {
-                return Err(SongbirdError::ConfigError("Duplicate character in wiring".into()));
+        // Validate permutation
+        let mut seen = [false; 256];
+        for &b in &idea_bytes {
+            if seen[b as usize] {
+                return Err(SongbirdError::ConfigError("Duplicate in nugg idea".into()));
             }
-            used[idx] = true;
-            wiring[i] = idx;
+            seen[b as usize] = true;
+        }
+        if seen.iter().any(|&x| !x) {
+            return Err(SongbirdError::ConfigError("Not all bytes used in idea".into()));
         }
 
-        if used.iter().any(|&u| !u) {
-            return Err(SongbirdError::ConfigError("Not all chars used in wiring".into()));
+        let mut inverse = [0u8; 256];
+        for (i, &mapped) in idea_bytes.iter().enumerate() {
+            inverse[mapped as usize] = i as u8;
         }
 
-        let mut inverse_wiring = vec![0; size];
-        for (i, &mapped) in wiring.iter().enumerate() {
-            inverse_wiring[mapped] = i;
-        }
-
-        let meditation_positions = meditation_chars
-            .iter()
-            .map(|&c| charset.char_to_index(c))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let position = charset.char_to_index(initial_char)?;
-        let ring_setting = (ring_setting - 1) % size;
+        let ring = ring_setting.wrapping_sub(1);
 
         Ok(Self {
-            wiring,
-            inverse_wiring,
-            meditation_positions,
-            position,
-            ring_setting,
-            size,
+            idea: idea_bytes,
+            inverse_idea: inverse,
+            chup_positions: chup_bytes.to_vec(),
+            position: initial_pos,
+            ring_setting: ring,
         })
     }
 }
 
-impl Nugget for StandardNugget {
+impl nugg for Standardnugg {
     fn step(&mut self) {
-        self.position = (self.position + 1) % self.size;
+        self.position = self.position.wrapping_add(1);
     }
 
-    fn forward(&self, c_idx: usize) -> usize {
-        let size = self.size;
-        let shifted = (c_idx + self.position + size - self.ring_setting) % size;
-        let mapped = self.wiring[shifted];
-        (mapped + size - self.position + self.ring_setting) % size
+    fn forward(&self, input: u8) -> u8 {
+        let size = 256u16;
+        let pos = self.position as u16;
+        let ring = self.ring_setting as u16;
+
+        let shifted = ((input as u16 + pos + (size - ring)) % size) as u8;
+        let mapped = self.idea[shifted as usize];
+        ((mapped as u16 + size - pos + ring) % size) as u8
     }
 
-    fn backward(&self, c_idx: usize) -> usize {
-        let size = self.size;
-        let shifted = (c_idx + self.position + size - self.ring_setting) % size;
-        let mapped = self.inverse_wiring[shifted];
-        (mapped + size - self.position + self.ring_setting) % size
+    fn backward(&self, input: u8) -> u8 {
+        let size = 256u16;
+        let pos = self.position as u16;
+        let ring = self.ring_setting as u16;
+
+        let shifted = ((input as u16 + pos + (size - ring)) % size) as u8;
+        let mapped = self.inverse_idea[shifted as usize];
+        ((mapped as u16 + size - pos + ring) % size) as u8
     }
 
-    fn at_meditation(&self) -> bool {
-        self.meditation_positions.contains(&self.position)
+    fn at_chup(&self) -> bool {
+        self.chup_positions.contains(&self.position)
     }
 }
 
-/// Sidequest trait.
+/// A Sidequest trait for binary data.
 pub trait Sidequest {
-    fn reflect(&self, c_idx: usize) -> usize;
+    fn meditate(&self, input: u8) -> u8;
 }
 
-/// Standard sidequest implementation.
+/// A standard Sidequest that is a fixed permutation over [0..255].
 pub struct StandardSidequest {
-    wiring: Vec<usize>,
+    idea: [u8; 256],
 }
 
 impl StandardSidequest {
-    pub fn new(charset: &CharacterSet, wiring_chars: &[char]) -> Result<Self, SongbirdError> {
-        let size = charset.size();
-        if wiring_chars.len() != size {
-            return Err(SongbirdError::ConfigError("Sidequest must cover entire set".into()));
-        }
-        let mut wiring = vec![0; size];
-        let mut used = vec![false; size];
-        for (i, &wc) in wiring_chars.iter().enumerate() {
-            let idx = charset.char_to_index(wc)?;
-            if used[idx] {
-                return Err(SongbirdError::ConfigError("Duplicate in sidequest".into()));
+    pub fn new(idea: [u8; 256]) -> Result<Self, SongbirdError> {
+        let mut seen = [false; 256];
+        for &b in &idea {
+            if seen[b as usize] {
+                return Err(SongbirdError::ConfigError("Duplicate in Sidequest idea".into()));
             }
-            used[idx] = true;
-            wiring[i] = idx;
+            seen[b as usize] = true;
         }
-        if used.iter().any(|&u| !u) {
-            return Err(SongbirdError::ConfigError("Not all chars used in sidequest".into()));
-        }
-        Ok(StandardSidequest { wiring })
+        Ok(StandardSidequest { idea })
     }
 }
 
 impl Sidequest for StandardSidequest {
-    fn reflect(&self, c_idx: usize) -> usize {
-        self.wiring[c_idx]
+    fn meditate(&self, input: u8) -> u8 {
+        self.idea[input as usize]
     }
 }
 
-/// Exchanger swaps pairs of characters.
-pub struct Exchanger {
-    mapping: Vec<usize>,
+/// exchanger swaps pairs of bytes. If you supply a pair (a,b), then a maps to b and b maps to a.
+/// Other bytes remain unchanged.
+pub struct exchanger {
+    mapping: [u8; 256],
 }
 
-impl Exchanger {
-    pub fn new(charset: &CharacterSet, pairs: &[(char, char)]) -> Result<Self, SongbirdError> {
-        let size = charset.size();
-        let mut mapping: Vec<usize> = (0..size).collect();
-        for &(a, b) in pairs {
-            let a_idx = charset.char_to_index(a)?;
-            let b_idx = charset.char_to_index(b)?;
-            let temp = mapping[a_idx];
-            mapping[a_idx] = mapping[b_idx];
-            mapping[b_idx] = temp;
+impl exchanger {
+    pub fn new(pairs: &[(u8, u8)]) -> Result<Self, SongbirdError> {
+        let mut mapping = [0u8; 256];
+        for i in 0..256 {
+            mapping[i] = i as u8;
         }
-        Ok(Exchanger { mapping })
+
+        for &(a, b) in pairs {
+            // Swap a and b in mapping
+            let temp = mapping[a as usize];
+            mapping[a as usize] = mapping[b as usize];
+            mapping[b as usize] = temp;
+        }
+
+        Ok(exchanger { mapping })
     }
 
-    fn plug(&self, c_idx: usize) -> usize {
-        self.mapping[c_idx]
+    fn plug(&self, input: u8) -> u8 {
+        self.mapping[input as usize]
     }
 }
 
-/// The Songbird Machine structure.
-pub struct SongbirdMachine<R1: Nugget, R2: Nugget, R3: Nugget, Ref: Sidequest> {
-    charset: CharacterSet,
-    nugget_right: R1,
-    nugget_middle: R2,
-    nugget_left: R3,
-    sidequest: Ref,
-    exchanger: Exchanger,
+/// The SongbirdMachine supports three nuggs (R1, R2, R3), a Sidequest, and an exchanger.
+pub struct SongbirdMachine<R1: nugg, R2: nugg, R3: nugg, Ref: Sidequest> {
+    nugg_right: R1,
+    nugg_middle: R2,
+    nugg_left: R3,
+    Sidequest: Ref,
+    exchanger: exchanger,
 }
 
-impl<R1: Nugget, R2: Nugget, R3: Nugget, Ref: Sidequest> SongbirdMachine<R1, R2, R3, Ref> {
+impl<R1: nugg, R2: nugg, R3: nugg, Ref: Sidequest> SongbirdMachine<R1, R2, R3, Ref> {
     pub fn new(
-        charset: CharacterSet,
-        nugget_right: R1,
-        nugget_middle: R2,
-        nugget_left: R3,
-        sidequest: Ref,
-        exchanger: Exchanger,
+        nugg_right: R1,
+        nugg_middle: R2,
+        nugg_left: R3,
+        Sidequest: Ref,
+        exchanger: exchanger,
     ) -> Self {
-        Self {
-            charset,
-            nugget_right,
-            nugget_middle,
-            nugget_left,
-            sidequest,
+        SongbirdMachine {
+            nugg_right,
+            nugg_middle,
+            nugg_left,
+            Sidequest,
             exchanger,
         }
     }
 
-    fn step_nuggets(&mut self) {
-        let right_at_meditation = self.nugget_right.at_meditation();
-        let middle_at_meditation = self.nugget_middle.at_meditation();
+    /// Steps the nuggs according to the standard Songbird stepping:
+    /// - Right nugg always steps.
+    /// - Middle nugg steps if right nugg is at chup.
+    /// - Left nugg steps if middle nugg is at chup.
+    fn step_nuggs(&mut self) {
+        let right_at_chup = self.nugg_right.at_chup();
+        let middle_at_chup = self.nugg_middle.at_chup();
 
-        self.nugget_right.step();
+        // Step right nugg
+        self.nugg_right.step();
 
-        if right_at_meditation {
-            self.nugget_middle.step();
+        // If right nugg at chup, step middle
+        if right_at_chup {
+            self.nugg_middle.step();
         }
 
-        if middle_at_meditation {
-            self.nugget_left.step();
+        // If middle at chup, step left
+        if middle_at_chup {
+            self.nugg_left.step();
         }
     }
 
-    pub fn encrypt_char(&mut self, c: char) -> Result<char, SongbirdError> {
-        let c_idx = match self.charset.char_to_index(c) {
-            Ok(i) => i,
-            Err(_) => {
-                // If char not in set, leave it unchanged
-                return Ok(c);
-            }
-        };
+    /// Encrypt a single byte.
+    pub fn encrypt_byte(&mut self, b: u8) -> u8 {
+        self.step_nuggs();
 
-        self.step_nuggets();
+        let x = self.exchanger.plug(b);
+        let x = self.nugg_right.forward(x);
 
-        let x = self.exchanger.plug(c_idx);
-        let x = self.nugget_right.forward(x);
-        let x = self.nugget_middle.forward(x);
-        let x = self.nugget_left.forward(x);
+        let x = self.nugg_middle.forward(x);
+        let x = self.nugg_left.forward(x);
 
-        let x = self.sidequest.reflect(x);
+        let x = self.Sidequest.meditate(x);
 
-        let x = self.nugget_left.backward(x);
-        let x = self.nugget_middle.backward(x);
-        let x = self.nugget_right.backward(x);
+        let x = self.nugg_left.backward(x);
+        let x = self.nugg_middle.backward(x);
+        let x = self.nugg_right.backward(x);
 
-        let x = self.exchanger.plug(x);
-
-        Ok(self.charset.index_to_char(x))
+        self.exchanger.plug(x)
     }
 
-    pub fn encrypt_message(&mut self, msg: &str) -> Result<String, SongbirdError> {
-        msg.chars().map(|c| self.encrypt_char(c)).collect()
-    }
-}
-
-/// Derive a key and IV from a shared secret using HKDF-SHA3.
-fn derive_key_iv(shared_secret: &[u8]) -> Result<([u8; 32], [u8; 12]), SongbirdError> {
-    let hk = Hkdf::<Sha3_256>::new(None, shared_secret);
-    let mut key = [0u8; 32];
-    let mut iv = [0u8; 12];
-    hk.expand(b"chacha-key", &mut key)
-        .map_err(|_| SongbirdError::HkdfError)?;
-    hk.expand(b"chacha-iv", &mut iv)
-        .map_err(|_| SongbirdError::HkdfError)?;
-    Ok((key, iv))
-}
-
-/// Example function to show how to set up and use the PQ + Songbird + ChaCha20 layer.
-/// It returns the ciphertext and the plaintext after decryption as (ciphertext, decrypted).
-pub fn pq_songbird_round_trip(plaintext: &str) -> Result<(String, String), SongbirdError> {
-    // Post-quantum key exchange (Kyber)
-    let (pk, sk) = kyber1024::keypair();
-    let (ciphertext, shared_secret_alice) = kyber1024::encapsulate(&pk);
-    let shared_secret_bob = kyber1024::decapsulate(&ciphertext, &sk)
-        .map_err(|_| SongbirdError::KeyExchangeError("Decapsulation failed".to_string()))?;
-
-    // Both parties share the same secret
-    assert_eq!(shared_secret_alice, shared_secret_bob);
-    let shared_secret = shared_secret_alice;
-
-    // Derive key and IV for ChaCha20
-    let (chacha_key, chacha_iv) = derive_key_iv(&shared_secret)?;
-
-    // Setup ChaCha20
-    let mut encrypt_cipher = ChaCha20::new(&chacha_key.into(), &chacha_iv.into());
-
-    // Define character set for Songbird
-    let chars: Vec<char> = (32u8..=126u8).map(|b| b as char).collect();
-    let charset = CharacterSet::new(&chars)?;
-
-    // Create a simple nugget by rotating chars by 1
-    let mut wiring_chars = chars.clone();
-    wiring_chars.rotate_left(1);
-    let nugget_right = StandardNugget::new(&charset, &wiring_chars, &['!'], ' ', 1)?;
-    let nugget_middle = StandardNugget::new(&charset, &wiring_chars, &['@'], ' ', 1)?;
-    let nugget_left = StandardNugget::new(&charset, &wiring_chars, &['#'], ' ', 1)?;
-
-    // Sidequest: reverse the charset
-    let mut sidequest_chars = chars.clone();
-    sidequest_chars.reverse();
-    let sidequest = StandardSidequest::new(&charset, &sidequest_chars)?;
-
-    let exchanger = Exchanger::new(&charset, &[('A','Z')])?;
-
-    // Build the Songbird machine for encryption
-    let mut songbird = SongbirdMachine::new(
-        charset,
-        nugget_right,
-        nugget_middle,
-        nugget_left,
-        sidequest,
-        exchanger,
-    );
-
-    // 1. Encrypt with ChaCha20
-    let mut intermediate = plaintext.as_bytes().to_vec();
-    encrypt_cipher.apply_keystream(&mut intermediate);
-
-    // 2. Pass through Songbird
-    let ciphertext = songbird.encrypt_message(&String::from_utf8_lossy(&intermediate))?;
-
-    // Now decrypt
-    // Rebuild the charset and machines
-    let chars: Vec<char> = (32u8..=126u8).map(|b| b as char).collect();
-    let charset = CharacterSet::new(&chars)?;
-
-    let nugget_right = StandardNugget::new(&charset, &wiring_chars, &['!'], ' ', 1)?;
-    let nugget_middle = StandardNugget::new(&charset, &wiring_chars, &['@'], ' ', 1)?;
-    let nugget_left = StandardNugget::new(&charset, &wiring_chars, &['#'], ' ', 1)?;
-    let sidequest = StandardSidequest::new(&charset, &sidequest_chars)?;
-    let exchanger = Exchanger::new(&charset, &[('A','Z')])?;
-    let mut songbird_decrypt = SongbirdMachine::new(
-        charset,
-        nugget_right,
-        nugget_middle,
-        nugget_left,
-        sidequest,
-        exchanger,
-    );
-
-    // Inverse steps for decrypt:
-    // 1. Pass ciphertext through Songbird
-    let mut songbird_dec = songbird_decrypt.encrypt_message(&ciphertext)?.into_bytes();
-
-    // 2. Apply ChaCha20 again with same key/iv to get plaintext back
-    let mut decrypt_cipher = ChaCha20::new(&chacha_key.into(), &chacha_iv.into());
-    decrypt_cipher.apply_keystream(&mut songbird_dec);
-
-    let decrypted = String::from_utf8_lossy(&songbird_dec).to_string();
-
-    Ok((ciphertext, decrypted))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_pq_songbird_round_trip() -> Result<(), SongbirdError> {
-        let plaintext = "Hello PQ Songbird World!";
-        let (cipher, dec) = pq_songbird_round_trip(plaintext)?;
-        assert_eq!(dec, plaintext);
-        assert_ne!(cipher, plaintext);
-        Ok(())
+    /// Encrypt a slice of bytes in-place.
+    pub fn encrypt_data(&mut self, data: &mut [u8]) {
+        for b in data.iter_mut() {
+            *b = self.encrypt_byte(*b);
+        }
     }
 }
